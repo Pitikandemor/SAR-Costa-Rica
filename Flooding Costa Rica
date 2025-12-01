@@ -1,0 +1,409 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+// Asegúrate de que ya tienes algo así arriba, o dibuja tu AOI y llámalo "geometry".
+// var geometry = ee.Geometry.Polygon(...);
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+
+// =======================================================
+// 0. GEO: ÁREA DE ESTUDIO (REGIÓN Guanacaste / Pacífico)
+// =======================================================
+
+var regionGeom = geometry;   // usa la geometría dibujada
+
+Map.centerObject(regionGeom, 8);
+Map.addLayer(regionGeom, {color: 'white'}, 'Región AOI');
+
+// Rango temporal
+var startDate = '2025-01-01';
+var endDate   = '2025-12-31';
+var wetStart  = '2025-04-01';
+var wetEnd    = '2025-12-31';
+
+// =======================================================
+// 1. TOPOGRAFÍA: HAND + PENDIENTE (ZONAS INUNDABLES)
+// =======================================================
+
+var dem   = ee.Image('USGS/SRTMGL1_003').clip(regionGeom);
+var hand  = ee.Image('users/gena/GlobalHAND/90m-global/hand-1000').clip(regionGeom);
+var slope = ee.Terrain.slope(dem).rename('slope');
+
+// Parámetros topográficos (ajustables)
+var handThresh     = 30;   // m sobre drenaje
+var maxSlopeHand   = 8;    // pendiente máxima cerca del drenaje
+var maxSlopeValley = 4;    // pendiente máxima en valles interiores
+var maxElevValley  = 1500; // límite de altitud para “valle interior”
+
+// 1) Zonas muy cercanas al drenaje (llanuras de inundación)
+var nearDrainMask = hand.lt(handThresh).and(slope.lt(maxSlopeHand));
+
+// 2) Valles interiores relativamente bajos
+var valleyMask = dem.lt(maxElevValley).and(slope.lt(maxSlopeValley));
+
+// Máscara final de zonas inundables
+var floodProneMaskRegion = nearDrainMask.or(valleyMask).rename('flood_prone_region');
+
+print('Parámetros topográficos Región -> handThresh:',
+      handThresh, 'maxSlopeHand:', maxSlopeHand,
+      'maxSlopeValley:', maxSlopeValley,
+      'maxElevValley:', maxElevValley);
+
+Map.addLayer(
+  floodProneMaskRegion.selfMask(),
+  {palette: ['ffff00']},
+  'Zonas inundables Región (HAND & valles)'
+);
+
+// =======================================================
+// 2. CHIRPS DIARIO (REGIÓN)
+// =======================================================
+
+var chirpsAllRegion = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterDate('2024-12-01', endDate)      // incluir diciembre 2024 para antecedente
+  .filterBounds(regionGeom)
+  .select('precipitation');
+
+var chirps2025Region = chirpsAllRegion
+  .filterDate(startDate, endDate);
+
+// 2.1 Antecedente 3 días
+function addAntecedent3Region(img) {
+  var date      = ee.Date(img.get('system:time_start'));
+  var startAnte = date.advance(-3, 'day');
+  var endAnte   = date;   // hasta justo antes del día actual
+
+  var P3 = chirpsAllRegion
+    .filterDate(startAnte, endAnte)
+    .sum()
+    .rename('P_ante3');
+
+  return img.addBands(P3);
+}
+
+var chirpsRegionWithAnte = chirps2025Region.map(addAntecedent3Region);
+
+// 2.2 Diagnóstico (máximos)
+var maxP0Region = chirps2025Region.select('precipitation').max()
+  .reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: regionGeom,
+    scale: 5000,
+    maxPixels: 1e9
+  }).get('precipitation');
+
+var maxP3Region = chirpsRegionWithAnte.select('P_ante3').max()
+  .reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: regionGeom,
+    scale: 5000,
+    maxPixels: 1e9
+  }).get('P_ante3');
+
+print('Máx P0 Región 2025 (mm/día):', maxP0Region);
+print('Máx P_ante3 Región 2025 (mm/3 días):', maxP3Region);
+
+// 2.3 Percentiles para definir extremos locales (con fallback)
+
+// Percentiles CHIRPS diarios
+var pP0Region = chirps2025Region.select('precipitation')
+  .reduce(ee.Reducer.percentile([95, 99]))
+  .reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: regionGeom,
+    scale: 5000,
+    maxPixels: 1e9
+  });
+
+// Percentiles de P_ante3
+var pP3Region = chirpsRegionWithAnte.select('P_ante3')
+  .reduce(ee.Reducer.percentile([95, 99]))
+  .reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: regionGeom,
+    scale: 5000,
+    maxPixels: 1e9
+  });
+
+print('Percentiles P0 Región:', pP0Region);
+print('Percentiles P_ante3 Región:', pP3Region);
+
+// Función auxiliar para manejar nulls
+function safeNumber(dict, key, fallback) {
+  return ee.Number(
+    ee.Algorithms.If(
+      dict.get(key),
+      dict.get(key),
+      fallback
+    )
+  );
+}
+
+// Usa valores por defecto si algo viene null
+var P0_95 = safeNumber(pP0Region, 'precipitation_p95', 35);
+var P0_99 = safeNumber(pP0Region, 'precipitation_p99', 55);
+var P3_95 = safeNumber(pP3Region, 'P_ante3_p95',       85);
+var P3_99 = safeNumber(pP3Region, 'P_ante3_p99',       125);
+
+print('Umbrales Región -> P0_95:', P0_95,
+      ' P0_99:', P0_99,
+      ' P3_95:', P3_95,
+      ' P3_99:', P3_99);
+
+// =======================================================
+// 3. ÍNDICE DE POSIBLE INUNDACIÓN (REGIÓN)
+// =======================================================
+//
+// flood_trigger_region = 1 si (en zona inundable):
+//   (P0 >= P0_99 AND P3 >= P3_95)
+//    OR
+//   (P0 >= P0_95 AND P3 >= P3_99)
+
+function addFloodTriggerRegion(img) {
+  var P0 = img.select('precipitation');
+  var P3 = img.select('P_ante3');
+
+  var cond1 = P0.gte(P0_99).and(P3.gte(P3_95));
+  var cond2 = P0.gte(P0_95).and(P3.gte(P3_99));
+
+  var trigger = cond1.or(cond2)
+    .updateMask(floodProneMaskRegion)
+    .rename('flood_trigger_region');
+
+  return img.addBands(trigger);
+}
+
+var floodIndexRegion = chirpsRegionWithAnte.map(addFloodTriggerRegion);
+
+// 3.1 Área afectada por día (km²)
+
+var pixelAreaKm2 = ee.Image.pixelArea().divide(1e6); // m² -> km²
+
+function addTriggerAreaRegion(img) {
+  var areaDict = img.select('flood_trigger_region')
+    .selfMask()
+    .gt(0)
+    .multiply(pixelAreaKm2)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: regionGeom,
+      scale: 5000,
+      maxPixels: 1e9
+    });
+
+  var areaKm2 = ee.Number(
+    ee.Algorithms.If(
+      areaDict.get('flood_trigger_region'),
+      areaDict.get('flood_trigger_region'),
+      0
+    )
+  );
+
+  return img.set('trigger_area_km2_region', areaKm2);
+}
+
+var floodIndexRegionWithArea = floodIndexRegion.map(addTriggerAreaRegion);
+
+// UMBRAL DE ÁREA (ajustable; ahora 80 km²)
+var minAreaRegionKm2 = 80;
+
+print('Umbral área Región (km²):', minAreaRegionKm2);
+
+// Eventos en todo el año y en estación lluviosa
+var eventDaysRegionAll = floodIndexRegionWithArea
+  .filter(ee.Filter.gte('trigger_area_km2_region', minAreaRegionKm2));
+
+var eventDaysRegionWet = eventDaysRegionAll
+  .filterDate(wetStart, wetEnd);
+
+print('Nº días con disparo en todo 2025 (Región):', eventDaysRegionAll.size());
+print('Nº días con disparo en estación lluviosa (Región):', eventDaysRegionWet.size());
+print('Áreas (km²) ejemplo (Región):',
+      eventDaysRegionWet.aggregate_array('trigger_area_km2_region'));
+print('Fechas (millis) eventos Región (wet):',
+      eventDaysRegionWet.aggregate_array('system:time_start'));
+
+print('Script terminado: CHIRPS + HAND automático para la región.');
+
+// Resumen con evaluate
+eventDaysRegionWet.size().evaluate(function(n) {
+  print('Nº días con disparo (Región, evaluado):', n);
+  if (n > 0) {
+    var firstEventImg = ee.Image(eventDaysRegionWet.first());
+    var firstDate     = ee.Date(firstEventImg.get('system:time_start'));
+    var areaFirst     = firstEventImg.get('trigger_area_km2_region');
+    print('Primer evento Región (wet):', firstDate);
+    print('Área inundable estimada (km²):', areaFirst);
+  } else {
+    print('No se detectaron eventos con los umbrales actuales en la región.');
+  }
+});
+
+// =======================================================
+// 5. SENTINEL-1 AUTOMÁTICO PARA TODOS LOS EVENTOS DE LA REGIÓN
+// =======================================================
+//
+// Requisitos previos (definidos arriba en tu script):
+// - geometry               -> AOI de la región (Guanacaste / Pacífico, etc.)
+// - floodProneMaskRegion   -> máscara HAND + pendiente para zonas inundables
+// - eventDaysRegionWet     -> colección de días disparados (CHIRPS) en época lluviosa
+//
+// Este bloque:
+//  - Recorre todos los eventos en eventDaysRegionWet
+//  - Busca la S1-VH pre y post más cercanas (± 20 días)
+//  - Genera máscara de inundación y RGB tipo Figura 10
+//  - Configura export a Google Drive
+
+// 5.1 Geometría de la región (por si acaso)
+var regionGeom = geometry;
+
+// 5.2 Lista de eventos (estación lluviosa)
+var eventListRegionWet = eventDaysRegionWet.toList(eventDaysRegionWet.size());
+var nEventsRegion      = eventDaysRegionWet.size().getInfo();
+
+print('Total eventos Región con lluvia extrema + HAND (wet):', nEventsRegion);
+
+// 5.3 Colección base Sentinel-1 (VH, IW, toda la órbita)
+var s1BaseAllRegion = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(regionGeom)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .select('VH');
+
+// 5.4 Bucle sobre eventos
+for (var i = 0; i < nEventsRegion; i++) {
+  var evImg   = ee.Image(eventListRegionWet.get(i));
+  var evDate  = ee.Date(evImg.get('system:time_start'));
+  var dateStr = evDate.format('YYYYMMdd').getInfo();
+
+  print('--- Evento Región idx', i, 'fecha:', evDate);
+
+  // Ventana de búsqueda S1 ± 20 días (puedes ajustar a ±12, ±15, etc.)
+  var preWindowStart = evDate.advance(-20, 'day');
+  var postWindowEnd  = evDate.advance(20,  'day');
+
+  // PRE: última imagen antes del evento
+  var s1PreCol = s1BaseAllRegion
+    .filterDate(preWindowStart, evDate)
+    .sort('system:time_start', false);  // descendente -> última antes
+
+  // POST: primera imagen después del evento
+  var s1PostCol = s1BaseAllRegion
+    .filterDate(evDate, postWindowEnd)
+    .sort('system:time_start', true);   // ascendente -> primera después
+
+  var nPre  = s1PreCol.size().getInfo();
+  var nPost = s1PostCol.size().getInfo();
+  print('   Nº imágenes PRE (candidatas):', nPre, ' POST (candidatas):', nPost);
+
+  if (nPre === 0 || nPost === 0) {
+    print('   ⚠ Se omite este evento por falta de imágenes S1 pre/post cercanas.');
+    continue;
+  }
+
+  // Tomamos SOLO la imagen más cercana antes y después
+  var s1_pre  = ee.Image(s1PreCol.first());
+  var s1_post = ee.Image(s1PostCol.first());
+
+  // Convertir a VH_dB y recortar a la región
+  s1_pre  = s1_pre.select('VH').log10().multiply(10).rename('VH_dB').clip(regionGeom);
+  s1_post = s1_post.select('VH').log10().multiply(10).rename('VH_dB').clip(regionGeom);
+
+  // Para info, imprime fechas efectivas PRE/POST
+  print('   Usando S1 PRE fecha:', ee.Date(s1_pre.get('system:time_start')));
+  print('         S1 POST fecha:', ee.Date(s1_post.get('system:time_start')));
+
+  // Diferencia dB (pre - post): valores grandes positivos = caída fuerte (posible agua nueva)
+  var dVH = s1_pre.subtract(s1_post).rename('dVH');
+
+  // Umbrales S1 (punto de partida; ajústalos con histogramas/inspección):
+  var vhWaterThresh = -18;  // VH_post muy bajo = lámina de agua
+  var dVHThresh     = 1.5;  // caída mínima necesaria (dB)
+
+  // ⚠ Si tu máscara se llama distinto (p.ej. floodProneMaskReg),
+  // cambia "floodProneMaskRegion" aquí:
+  var floodedRegion = s1_post.select('VH_dB').lt(vhWaterThresh)
+    .and(dVH.gt(dVHThresh))
+    .updateMask(floodProneMaskRegion)
+    .clip(regionGeom)
+    .rename('flooded_region_' + dateStr);
+
+  // -----------------------
+  // VISUALIZACIÓN EN EL MAPA (solo para el primer evento, para no saturar)
+  // -----------------------
+  if (i === 0) {
+    Map.centerObject(regionGeom, 8);
+    Map.addLayer(
+      s1_pre.select('VH_dB'),
+      {min: -25, max: 0},
+      'S1 VH_dB PRE (Región, ' + dateStr + ')'
+    );
+    Map.addLayer(
+      s1_post.select('VH_dB'),
+      {min: -25, max: 0},
+      'S1 VH_dB POST (Región, ' + dateStr + ')'
+    );
+    Map.addLayer(
+      dVH,
+      {min: -3, max: 3, palette: ['red', 'white', 'blue']},
+      'ΔVH (pre - post, Región, ' + dateStr + ')'
+    );
+    Map.addLayer(
+      floodedRegion.selfMask(),
+      {palette: ['cyan']},
+      'Inundación probable (Región, ' + dateStr + ')'
+    );
+  }
+
+  // -----------------------
+  // COMPOSICIÓN RGB TIPO FIGURA 10 (artículo río Frío)
+  // -----------------------
+  //
+  // R = VH_dB PRE
+  // G = VH_dB POST
+  // B = VH_dB POST
+  //
+  // Zonas inundadas recientes tienden a aparecer rojizas porque VH baja en POST. :contentReference[oaicite:2]{index=2}
+
+  var rgbStack = ee.Image.cat(
+    s1_pre.select('VH_dB'),
+    s1_post.select('VH_dB'),
+    s1_post.select('VH_dB')
+  ).clip(regionGeom);
+
+  var rgbVis = rgbStack.visualize({
+    min: -25,
+    max: 0
+  });
+
+  // -----------------------
+  // EXPORTS AUTOMÁTICOS (Drive)
+//  ⚠ GEE solo deja lanzar un nº limitado de tareas a la vez.
+//  Si son demasiados eventos, puedes:
+//    - comentar algunos Export, o
+//    - limitar el bucle: for (var i = 0; i < Math.min(nEventsRegion, 5); i++)
+  // -----------------------
+
+  // 1) Raster binario de inundación probable (GeoTIFF)
+  Export.image.toDrive({
+    image: floodedRegion,
+    description: 'Region_floodMask_S1_' + dateStr,
+    folder: 'GEE_Region_floods',
+    fileNamePrefix: 'Region_floodMask_S1_' + dateStr,
+    region: regionGeom,
+    scale: 20,
+    maxPixels: 1e13
+  });
+
+  // 2) Composición RGB tipo Figura 10 (GeoTIFF + vista “bonita”)
+  Export.image.toDrive({
+    image: rgbVis,
+    description: 'Region_RGB_S1_' + dateStr,
+    folder: 'GEE_Region_floods',
+    fileNamePrefix: 'Region_RGB_S1_' + dateStr,
+    region: regionGeom,
+    scale: 20,
+    maxPixels: 1e13
+  });
+
+  print('   ✔ Export configurado para evento Región', dateStr);
+}
+
+print('Script Sentinel-1 terminado para la región (todos los eventos).');
