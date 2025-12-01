@@ -1,0 +1,232 @@
+// =====================================================
+// 0. PARÁMETROS GLOBALES
+// =====================================================
+
+// Fechas del "evento" (lluvia) --------------
+// (ajusta según tu caso: Cambronero, Talamanca, etc.)
+var START = '2025-05-01';
+var END   = '2025-06-29';
+
+// Umbrales (ajusta según evento / pruebas) --
+var RAIN_THRESHOLD  = 50;    // mm acumulados CHIRPS en la ventana
+var SLOPE_THRESHOLD = 10;    // grados
+var HAND_MIN        = 5;     // m sobre drenaje
+var HAND_MAX        = 200;   // m sobre drenaje
+var UPA_THRESHOLD   = 50;    // km² de área de drenaje para cauces "principales"
+var DMAX_THRESHOLD  = 2.0;   // |Δσ0| en dB (Sentinel-1)
+var MIN_AREA_M2     = 500;   // área mínima de polígono candidato
+
+// Ventanas de Sentinel-1 alrededor del evento ------
+var PRE_DAYS  = 20;          // días antes de START
+var POST_DAYS = 20;          // días después de END
+
+// Área de estudio: usa tu geometry dibujada
+// (si quieres todo Costa Rica, cambia por un FeatureCollection de CR)
+var studyArea = geometry;
+
+
+// =====================================================
+// 1. LLUVIA CHIRPS
+// =====================================================
+
+var start = ee.Date(START);
+var end   = ee.Date(END);
+
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterDate(start, end)
+  .filterBounds(studyArea);
+
+var rainCum = chirps
+  .select('precipitation')
+  .sum()
+  .clip(studyArea)
+  .rename('Pcum');
+
+print('Colección CHIRPS filtrada:', chirps);
+print('Lluvia acumulada evento (mm):', rainCum);
+
+var heavyRainMask = rainCum.gte(RAIN_THRESHOLD);
+
+// Visual rápido
+Map.centerObject(studyArea, 8);
+Map.addLayer(
+  rainCum,
+  {min: 0, max: 300, palette: ['ffffff', 'b3cde3', '8c96c6', '8856a7', '810f7c']},
+  'CHIRPS lluvia acumulada',
+  false
+);
+Map.addLayer(
+  heavyRainMask.selfMask(),
+  {palette: ['0000ff']},
+  'CHIRPS ≥ umbral lluvia',
+  false
+);
+
+
+// =====================================================
+// 2. TOPOGRAFÍA: DEM + HAND + drenajes
+// =====================================================
+
+// DEM SRTM
+var dem = ee.Image('USGS/SRTMGL1_003').clip(studyArea);
+var slope = ee.Terrain.slope(dem).rename('slope');
+
+// MERIT Hydro para HAND y área de drenaje
+var merit = ee.Image('MERIT/Hydro/v1_0_1').clip(studyArea);
+var hand  = merit.select('hnd');  // altura sobre drenaje (m)
+var upa   = merit.select('upa');  // área de drenaje (km²)
+
+// Drenajes principales
+var mainChannels = upa.gte(UPA_THRESHOLD);
+var mainChannelsBuffer = mainChannels.focal_max(3);
+
+// Laderas
+var steepSlopes = slope.gte(SLOPE_THRESHOLD);
+var midHand = hand.gte(HAND_MIN).and(hand.lte(HAND_MAX));
+
+// Máscara topográfica final
+var topoMask = steepSlopes
+  .and(midHand)
+  .and(mainChannelsBuffer);
+
+Map.addLayer(slope, {min: 0, max: 60}, 'Pendiente (°)', false);
+Map.addLayer(
+  hand, {min: 0, max: 50, palette: ['0000ff','00ffff','ffff00','ff0000']},
+  'HAND (m)', false
+);
+Map.addLayer(
+  topoMask.selfMask(),
+  {palette: ['ff0000']},
+  'Máscara laderas prioritarias',
+  false
+);
+
+
+// =====================================================
+// 3. SENTINEL-1 GRD: cambio de retrodispersión
+// =====================================================
+
+// Ventanas temporales S1 en torno al episodio de lluvia
+var preStart  = start.advance(-PRE_DAYS, 'day');
+var preEnd    = start.advance(-1, 'day');
+var postStart = end;
+var postEnd   = end.advance(POST_DAYS, 'day');
+
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(studyArea)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING')); // quita esto si quieres también ASCENDING
+
+var s1Pre  = s1.filterDate(preStart, preEnd);
+var s1Post = s1.filterDate(postStart, postEnd);
+
+print('Número de escenas S1 pre-evento:', s1Pre.size());
+print('Número de escenas S1 post-evento:', s1Post.size());
+
+// Si no hay S1 suficiente, evitamos errores y dejamos dMax vacío
+var haveS1 = s1Pre.size().gt(0).and(s1Post.size().gt(0));
+
+var emptyDMax = ee.Image(0).updateMask(0).rename('dMax');
+
+var dMax = ee.Image(
+  ee.Algorithms.If(
+    haveS1,
+    // --- rama "sí hay S1" ---
+    (function () {
+      var preMed  = s1Pre.median().clip(studyArea);
+      var postMed = s1Post.median().clip(studyArea);
+
+      var preVV_dB  = preMed.select('VV').log10().multiply(10);
+      var postVV_dB = postMed.select('VV').log10().multiply(10);
+      var preVH_dB  = preMed.select('VH').log10().multiply(10);
+      var postVH_dB = postMed.select('VH').log10().multiply(10);
+
+      var dVV = postVV_dB.subtract(preVV_dB).abs();
+      var dVH = postVH_dB.subtract(preVH_dB).abs();
+
+      return dVV.max(dVH).rename('dMax');
+    })(),
+    // --- rama "no hay S1" ---
+    emptyDMax
+  )
+);
+
+Map.addLayer(
+  dMax,
+  {min: 0, max: 6, palette: ['ffffff','ffff00','ff0000']},
+  'Δσ0 |dB| (max VV/VH)',
+  false
+);
+
+
+// =====================================================
+// 4. CANDIDATOS: lluvia + topografía + cambio S1
+// =====================================================
+
+var changeMask = dMax.gt(DMAX_THRESHOLD);
+Map.addLayer(
+  changeMask.selfMask(),
+  {palette: ['ffa500']},
+  'Cambios S1 > umbral',
+  false
+);
+
+// combinación de criterios
+var candidateMask = changeMask
+  .and(topoMask)
+  .and(heavyRainMask)
+  .selfMask()
+  .rename('candidates');
+
+print('Mapa de candidatos (raster):', candidateMask);
+
+var pixelCount = candidateMask
+  .reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: studyArea,
+    scale: 30,
+    maxPixels: 1e9
+  });
+print('Número de píxeles candidatos (aprox):', pixelCount);
+
+Map.addLayer(
+  candidateMask,
+  {palette: ['ff00ff']},
+  'Candidatos a deslizamiento (raster)',
+  true
+);
+
+
+// =====================================================
+// 5. VECTORIZACIÓN Y FILTRO POR ÁREA
+// =====================================================
+
+var vectors = candidateMask.reduceToVectors({
+  geometry: studyArea,
+  scale: 30,
+  geometryType: 'polygon',
+  eightConnected: true,
+  maxPixels: 1e9
+});
+
+// Añade área con margen para evitar error Geometry.area
+var vectorsWithArea = vectors.map(function (f) {
+  var a = f.geometry(ee.ErrorMargin(10)).area();  // margen 10 m
+  return f.set('area_m2', a);
+});
+
+var vectorsFiltered = vectorsWithArea.filter(
+  ee.Filter.gte('area_m2', MIN_AREA_M2)
+);
+
+print('Número de polígonos candidatos (filtrados):', vectorsFiltered.size());
+print('Polígonos candidatos:', vectorsFiltered);
+
+Map.addLayer(
+  vectorsFiltered,
+  {color: 'cyan'},
+  'Polígonos candidatos',
+  false
+);
